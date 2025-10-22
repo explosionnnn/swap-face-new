@@ -63,6 +63,33 @@ def init_gfpgan():
         print(f"GFPGAN initialization failed: {e}")
         return None
 
+
+def warp_triangle(img1, img2, t1, t2):
+    r1 = cv2.boundingRect(np.float32([t1]))
+    r2 = cv2.boundingRect(np.float32([t2]))
+
+    t1_rect = []
+    t2_rect = []
+    for i in range(3):
+        t1_rect.append(((t1[i][0] - r1[0]), (t1[i][1] - r1[1])))
+        t2_rect.append(((t2[i][0] - r2[0]), (t2[i][1] - r2[1])))
+
+    mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
+    cv2.fillConvexPoly(mask, np.int32(t2_rect), (1.0, 1.0, 1.0), 16, 0)
+
+    M = cv2.getAffineTransform(np.float32(t1_rect), np.float32(t2_rect))
+    warped = cv2.warpAffine(
+        img1[r1[1]:r1[1]+r1[3], r1[0]:r1[0]+r1[2]],
+        M,
+        (r2[2], r2[3]),
+        None,
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101
+    )
+    img2_rect = img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]]
+    img2_rect = img2_rect * (1 - mask) + warped * mask
+    img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]] = img2_rect
+
 # ----------------------------
 # 換臉函數
 # ----------------------------
@@ -86,21 +113,56 @@ def swap_faces(source_img, target_img, ref_embedding, gfpgan=None, alpha=0.7, th
 
         target_landmarks = t_face.landmark_2d_106
 
-        # 🟡 1️⃣ 額頭補點
-        extra_points = []
         top_y = np.min(target_landmarks[:, 1])
         top_x = np.mean(target_landmarks[:, 0])
-        extra_points.append([top_x, top_y - 40])
-        extra_points.append([top_x - 30, top_y - 30])
-        extra_points.append([top_x + 30, top_y - 30])
+        h = np.max(target_landmarks[:, 1]) - np.min(target_landmarks[:, 1])
+        w = np.max(target_landmarks[:, 0]) - np.min(target_landmarks[:, 0])
 
-        # 合併原臉與額頭點
-        all_landmarks = np.vstack([target_landmarks, np.array(extra_points)])
+        extra_points = np.array([
+            [top_x,             top_y - 0.22 * h],
+            [top_x - 0.18 * w,  top_y - 0.18 * h],
+            [top_x + 0.18 * w,  top_y - 0.18 * h],
+        ], dtype=np.float32)
+
+        all_target = np.vstack([target_landmarks, extra_points])  # (N+3,2)
+
+        # ---------- B) 來源對應點：中心位移外推（簡易法） ----------
+        src_center = np.mean(source_landmarks, axis=0)
+        tgt_center = np.mean(target_landmarks, axis=0)
+        # 以目標新點的「相對中心位移」搬運到來源中心，得到來源額頭對應點
+        extra_src = src_center + (extra_points - tgt_center)
+        all_source = np.vstack([source_landmarks, extra_src])     # (N+3,2)
+
+        # ✅ 改用 Delaunay 三角形變形 (取代表情不動的 warpAffine)
+        rect = cv2.boundingRect(np.float32(target_landmarks))
+        subdiv = cv2.Subdiv2D(rect)
+        for p in target_landmarks:
+            subdiv.insert(tuple(p))
+        triangles = subdiv.getTriangleList()
+
+        target_warped = target_img.copy()
+         # 把來源臉 warp 成與目標臉表情一致
+        warped_source = np.zeros_like(target_img)
+
+
+
+
+
+        all_landmarks = all_target
+
+        for tri in triangles:
+            pts1, pts2 = [], []
+            for j in range(0, 6, 2):
+                p = (tri[j], tri[j + 1])
+                idx = np.argmin(np.linalg.norm(target_landmarks - p, axis=1))
+                pts1.append(source_landmarks[idx])
+                pts2.append(target_landmarks[idx])
+            warp_triangle(source_img, warped_source, pts1, pts2)
 
         # 🟢 2️⃣ 放大整體遮罩範圍
         center = np.mean(all_landmarks, axis=0)
         scale_x = 1.05
-        scale_y = 1.15
+        scale_y = 1.25
         expanded_landmarks = (all_landmarks - center) * [scale_x, scale_y] + center
 
         # 🟣 3️⃣ 建立最終遮罩
@@ -109,23 +171,21 @@ def swap_faces(source_img, target_img, ref_embedding, gfpgan=None, alpha=0.7, th
                         cv2.convexHull(expanded_landmarks.astype(np.int32)),
                         255)
 
-        # 🟠 4️⃣ 對齊臉部
-        hull_index = cv2.convexHull(target_landmarks.astype(np.int32), returnPoints=False)
-        M, _ = cv2.estimateAffinePartial2D(
-            source_landmarks[hull_index[:, 0]],
-            target_landmarks[hull_index[:, 0]]
-        )
-        warped_source = cv2.warpAffine(source_img, M, (target_img.shape[1], target_img.shape[0]))
 
-        # 🟡 5️⃣ 模糊邊緣（讓融合自然）
-        mask = cv2.GaussianBlur(mask, (9, 9), 9)
-        mask = mask * (255.0 / mask.max())
-        mask = np.clip(mask, 0, 255).astype(np.uint8)
+        # 邊緣平滑（注意 kernel 要奇數）
+        mask = cv2.GaussianBlur(mask, (9, 9), 15)
+        mmax = mask.max()
+        if mmax > 0:
+            mask = (mask * (255.0 / mmax)).clip(0, 255).astype(np.uint8)  # 防止過度變淡
 
-        # 🧩 6️⃣ 融合 source 臉與 target 臉
-        mask_f = mask.astype(np.float32) / 255.0
-        swapped = warped_source * mask_f[..., None] + target_img * (1 - mask_f[..., None])
-        swapped = swapped.astype(np.uint8)
+        # 與 warped_source 的有效區域取交集（避免額頭黑）
+        valid = (warped_source.sum(axis=2) > 0).astype(np.uint8) * 255
+        mask = cv2.bitwise_and(mask, valid)
+
+        # --------- C. 融合（疊到 output_img，非 target_img）---------
+        mask_f = (mask.astype(np.float32) / 255.0)[..., None] * float(alpha)
+        swapped = (warped_source.astype(np.float32) * mask_f
+                   + output_img.astype(np.float32) * (1.0 - mask_f)).astype(np.uint8)
 
 
      # ---- 使用新版 GFPGAN API ----
@@ -144,10 +204,7 @@ def swap_faces(source_img, target_img, ref_embedding, gfpgan=None, alpha=0.7, th
                 # 失敗就使用原本 warp，不返回 None
                 pass
 
-        target_region = cv2.bitwise_and(output_img, output_img, mask=cv2.bitwise_not(mask))
-        source_region = cv2.bitwise_and(warped_source, warped_source, mask=mask)
-        blended = cv2.addWeighted(target_region, 1-alpha, source_region, alpha, 0)
-        output_img[np.where(mask==255)] = blended[np.where(mask==255)]
+        output_img = swapped
 
     return output_img
 
@@ -195,6 +252,12 @@ def process_video(source_img, input_path, output_path, ref_embedding, gfpgan=Non
     out.release()
     print("\nVideo processing finished.")
     return True
+
+# ----------------------------
+# 三角形切割
+# ----------------------------
+
+
 
 
 # ----------------------------
