@@ -11,7 +11,8 @@ arguments:
 --output: Output video
 --reference: Reference face for main character
 --gfpgan: Use GFPGAN enhancement
-ex: python face-swap.py --source data/source.jpg --reference data/reference.jpg --input data/input.mp4 --output results/output.mp4 --gfpgan
+--threhold: Cosine similarity threshold
+ex: python face-swap.py --source data/source.jpg --reference data/reference.jpg --input data/input.mp4 --output results/output.mp4 --gfpgan --threshold 0.3
 
 bug:
 from torchvision.transforms.functional_tensor import rgb_to_grayscale
