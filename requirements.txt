@@ -6,7 +6,7 @@ opencv-python
 insightface
 
 # PyTorch（GFPGAN 需要）
-torch>=1.7
+torch>=1.7 # 依GPU版本選擇合適的torch和torchvision，可參考官方安裝指南：https://pytorch.org/get-started/locally/
 torchvision
 
 # GFPGAN 及其依賴
