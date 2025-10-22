@@ -5,6 +5,28 @@ from insightface.app import FaceAnalysis
 from gfpgan import GFPGANer
 from numpy.linalg import norm
 import torch
+import os
+
+def setup_cuda_fast():
+    if not torch.cuda.is_available():
+        return
+
+    # 1) 讓 cuDNN 自動挑最快的 conv 實作（輸入尺寸穩定時特別有效）
+    torch.backends.cudnn.benchmark = True
+
+    # 2) Ampere(8.x)/Ada(8.9) 可用 TF32：幾乎不影響畫質但大幅加速 matmul/conv
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # 3) 允許更激進的 float32 matmul 近似（對推論 OK）
+    torch.set_float32_matmul_precision('high')  # 'medium' 也行
+
+    # 4) 預先建立一個專用 Stream（可選，避免與預設串流搶資源）
+    global _fast_stream
+    _fast_stream = torch.cuda.Stream()
+    return
+
+setup_cuda_fast()
 
 # ----------------------------
 # 初始化 InsightFace
@@ -64,31 +86,98 @@ def init_gfpgan():
         return None
 
 
-def warp_triangle(img1, img2, t1, t2):
-    r1 = cv2.boundingRect(np.float32([t1]))
-    r2 = cv2.boundingRect(np.float32([t2]))
+# -- 安全版三角形 warp：避免 0 邊界吃黑，做 ROI 裁切與反射邊界 --
+def warp_triangle(src_img, dst_img, pts_src, pts_dst):
+    pts_src = np.float32(pts_src)
+    pts_dst = np.float32(pts_dst)
 
-    t1_rect = []
-    t2_rect = []
-    for i in range(3):
-        t1_rect.append(((t1[i][0] - r1[0]), (t1[i][1] - r1[1])))
-        t2_rect.append(((t2[i][0] - r2[0]), (t2[i][1] - r2[1])))
+    r1 = cv2.boundingRect(pts_src)
+    r2 = cv2.boundingRect(pts_dst)
 
-    mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
-    cv2.fillConvexPoly(mask, np.int32(t2_rect), (1.0, 1.0, 1.0), 16, 0)
+    # ROI
+    src_roi = src_img[r1[1]:r1[1]+r1[3], r1[0]:r1[0]+r1[2]]
+    dst_roi = dst_img[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]]
 
-    M = cv2.getAffineTransform(np.float32(t1_rect), np.float32(t2_rect))
+    # 轉換到 ROI 座標
+    t1 = pts_src - np.array([r1[0], r1[1]], dtype=np.float32)
+    t2 = pts_dst - np.array([r2[0], r2[1]], dtype=np.float32)
+
+    # 仿射
+    M = cv2.getAffineTransform(t1, t2)
     warped = cv2.warpAffine(
-        img1[r1[1]:r1[1]+r1[3], r1[0]:r1[0]+r1[2]],
-        M,
-        (r2[2], r2[3]),
-        None,
+        src_roi, M, (r2[2], r2[3]),
         flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REFLECT_101
+        borderMode=cv2.BORDER_REFLECT101   # 關鍵：避免黑邊
     )
-    img2_rect = img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]]
-    img2_rect = img2_rect * (1 - mask) + warped * mask
-    img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]] = img2_rect
+
+    # 建三角形遮罩
+    mask = np.zeros((r2[3], r2[2]), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, np.int32(t2), 255)
+    mask = cv2.GaussianBlur(mask, (3,3), 0)
+
+    # 貼回（局部 alpha）
+    mask_f = (mask.astype(np.float32)/255.0)[..., None]
+    dst_roi[:] = (warped*mask_f + dst_roi*(1.0 - mask_f)).astype(np.uint8)
+
+
+    # === A) 智慧遮罩：距離羽化 + 輕度膨脹 ===
+def build_smart_mask(all_target, shape, scale_x=1.18, scale_y=1.27, blur=13, dilate_ksize=9):
+    H, W = shape[:2]
+    center = np.mean(all_target, axis=0).astype(np.float32)
+    expanded = (all_target - center) * np.array([scale_x, scale_y], np.float32) + center
+
+    mask = np.zeros((H, W), np.uint8)
+    cv2.fillConvexPoly(mask, cv2.convexHull(expanded.astype(np.int32)), 255)
+
+    if dilate_ksize and dilate_ksize > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_ksize, dilate_ksize))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+    # 距離變換 → 由內向外平滑權重
+    dist = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 3)
+    if dist.max() > 0:
+        dist = dist / dist.max()
+    soft = (dist * 255).astype(np.uint8)
+
+    if blur and blur % 2 == 1:
+        soft = cv2.GaussianBlur(soft, (blur, blur), 0)
+
+    return soft  # 單通道 0~255
+
+def color_match_lab(src_bgr, target_bgr, mask_u8=None, blend_ratio=0.7):
+
+#    將 src_bgr（已 warp 的臉）顏色匹配到 target_bgr（被換上的人）。
+#    mask_u8 可選：若提供，僅在 mask>0 的區域做統計；否則用 src_bgr 的非零像素。
+#    blend_ratio: 0.0~1.0，越高越貼近目標臉顏色。
+
+    src = src_bgr
+    tgt = target_bgr
+
+    if mask_u8 is not None:
+        m = (mask_u8 > 0)
+    else:
+        # 沒有 mask：用 src 的非黑區域當統計範圍
+        m = (src.sum(axis=2) > 0)
+
+    if m.sum() < 100:
+        return src
+
+    src_lab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
+    tgt_lab = cv2.cvtColor(tgt, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    out = src_lab.copy()
+    for c in range(3):
+        s = src_lab[..., c][m]; t = tgt_lab[..., c][m]
+        s_mean, s_std = float(s.mean()), float(s.std() + 1e-6)
+        t_mean, t_std = float(t.mean()), float(t.std() + 1e-6)
+        matched = (out[..., c] - s_mean) * (t_std / s_std) + t_mean
+        out[..., c] = out[..., c] * (1 - blend_ratio) + matched * blend_ratio
+
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(out, cv2.COLOR_LAB2BGR)
+
+# 你原本的 warp_triangle() 要存在
+# def warp_triangle(src_img, dst_img, pts_src, pts_dst): ...
 
 # ----------------------------
 # 換臉函數
@@ -122,19 +211,35 @@ def swap_faces(source_img, target_img, ref_embedding, gfpgan=None, alpha=0.65, t
         #  A) 25 點額頭網格：上/中/下 三層（7 + 9 + 9 = 25）
         #     橫向覆蓋額頭與髮際下緣，等距分佈以穩定 Delaunay。
         # =====================================================
+        # === 25 額頭點：把水平線改成弧線 ===
         layers = [
-            (-0.12 * h, 7),   # 接近眉上緣
-            (-0.20 * h, 9),   # 額頭中層
-            (-0.27 * h, 9),   # 接近髮際下緣
+            (-0.12 * h, 7),   # 上層
+            (-0.20 * h, 9),   # 中層
+            (-0.27 * h, 9),   # 下層（接近髮際）
         ]
         extra_points_list = []
         for y_off, n_pts in layers:
             x_start = top_x - 0.35 * w
             x_end   = top_x + 0.35 * w
-            xs = np.linspace(x_start, x_end, int(n_pts))
-            ys = np.full_like(xs, top_y + y_off, dtype=np.float32)
-            extra_points_list.append(np.stack([xs.astype(np.float32), ys], axis=1))
-        extra_points = np.concatenate(extra_points_list, axis=0).astype(np.float32)  # shape: (25,2)
+            xs = np.linspace(x_start, x_end, int(n_pts)).astype(np.float32)
+
+            # 做一個左右略高、中間略低的弧形（cos 曲線）
+            # amp 可微調弧度：下層弧度大、上層小
+            rel = (xs - top_x) / (0.35 * w)  # -1..1
+            # 針對不同層給不同弧度
+            if n_pts == 9 and abs(y_off + 0.27*h) < 1e-3:   # 下層
+                amp = 0.06 * h
+            elif n_pts == 9:                                 # 中層
+                amp = 0.045 * h
+            else:                                            # 上層
+                amp = 0.03 * h
+
+            curve = amp * (1 - np.cos(np.pi * (1 - np.abs(rel))))  # 兩側↑ 中間↓
+            ys = (top_y + y_off - curve).astype(np.float32)
+
+            extra_points_list.append(np.stack([xs, ys], axis=1))
+
+        extra_points = np.concatenate(extra_points_list, axis=0).astype(np.float32)  # (25,2)
 
         all_target = np.vstack([target_landmarks, extra_points])  # (N+3,2)
 
@@ -189,7 +294,7 @@ def swap_faces(source_img, target_img, ref_embedding, gfpgan=None, alpha=0.65, t
         # 建立一個 KD 查表（或簡單最近鄰）：這次一定用 all_target，不是 target_landmarks！
         # （若擔心誤配，可先四捨五入後 dict 映射）
         # 這裡用最近鄰，並做唯一性檢查避免退化三角形。
-        warped_source = np.zeros_like(target_img)
+        warped_source = target_img.copy()   # ★ 改這裡：不要用 zeros_like
 
         for tri in triangles:
             p1 = np.array([tri[0], tri[1]], dtype=np.float32)
@@ -210,56 +315,47 @@ def swap_faces(source_img, target_img, ref_embedding, gfpgan=None, alpha=0.65, t
 
             warp_triangle(source_img, warped_source, pts_src, pts_tgt)
 
-        # 🟢 2️⃣ 放大整體遮罩範圍
-        center = np.mean(all_landmarks, axis=0)
-        scale_x = 1.10
-        scale_y = 1.25
-        expanded_landmarks = (all_landmarks - center) * [scale_x, scale_y] + center
-
-        # 🟣 3️⃣ 建立最終遮罩
-        mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
-        cv2.fillConvexPoly(mask,
-                        cv2.convexHull(expanded_landmarks.astype(np.int32)),
-                        255)
-
-
-        # 邊緣平滑（注意 kernel 要奇數）
-        # 先高斯再形態膨脹，讓兩側更「有料」
-        mask = cv2.GaussianBlur(mask, (13, 13), 0)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        mask = cv2.dilate(mask, kernel, iterations=1)
-
-        # 與 warped_source 的有效區域取交集（避免額頭黑）
-        valid = (warped_source.sum(axis=2) > 0).astype(np.uint8) * 255
-        mask = cv2.bitwise_and(mask, valid)
-
-        # --------- C. 融合（疊到 output_img，非 target_img）---------
-        mask_f = (mask.astype(np.float32) / 255.0)[..., None] * float(alpha)
-        swapped = (warped_source.astype(np.float32) * mask_f
-                   + output_img.astype(np.float32) * (1.0 - mask_f)).astype(np.uint8)
-
-
-     # ---- 使用新版 GFPGAN API ----
+        # （選）GFPGAN：放在色彩對齊之前；此處不要動用 mask
         if gfpgan is not None:
             try:
-                # 這裡用 warped_source 進修復，再重做融合會更自然
-                restored_faces, restored_img, _ = gfpgan.enhance(
-                    warped_source, has_aligned=False, only_center_face=False, paste_back=True
+                _, restored_img, _ = gfpgan.enhance(
+                    np.ascontiguousarray(warped_source),
+                    has_aligned=False, only_center_face=False, paste_back=True
                 )
                 if isinstance(restored_img, np.ndarray) and restored_img.size > 0:
                     warped_source = restored_img
-                    # 重新計算 valid & 融合（避免用舊的 swapped）
-                    valid = (warped_source.sum(axis=2) > 0).astype(np.uint8) * 255
-                    mask = cv2.bitwise_and(mask, valid)
-                    mask_f = (mask.astype(np.float32) / 255.0)[..., None] * float(alpha)
-                    swapped = (warped_source.astype(np.float32) * mask_f
-                               + output_img.astype(np.float32) * (1.0 - mask_f)).astype(np.uint8)
             except Exception as e:
                 print(f"GFPGAN enhance failed, fallback to original warp: {e}")
-                # 失敗就使用原本 warp，不返回 None
-                pass
 
-        output_img = swapped
+        # --- 僅色彩貼合（不建智慧遮罩）---
+        # 用 warped_source 的有效像素當統計遮罩（避免把背景也拿去算）
+        valid_for_stats = (warped_source.sum(axis=2) > 0).astype(np.uint8) * 255
+        warped_source = color_match_lab(warped_source, output_img, valid_for_stats, blend_ratio=0.7)
+        output_img    = np.ascontiguousarray(output_img)
+        warped_source = color_match_lab(warped_source, output_img, valid_for_stats, blend_ratio=0.75)
+
+        scale_x = 1.05
+        scale_y = 1.15
+        # 你原本就有的融合遮罩（非智慧遮罩版）
+        center = np.mean(all_target, axis=0)
+        expanded_landmarks = (all_target - center) * [scale_x, scale_y] + center
+
+        mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, cv2.convexHull(expanded_landmarks.astype(np.int32)), 255)
+        # 先擴一點再柔和，避免硬邊
+        mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5)), 1)
+        mask = cv2.GaussianBlur(mask, (15,15), 0)
+
+        # 與 warped_source 有效區域取交集，避免黑洞
+        valid = (warped_source.sum(axis=2) > 0).astype(np.uint8) * 255
+        mask = cv2.bitwise_and(mask, valid)
+
+
+        # Alpha 融合
+        mask_f = (mask.astype(np.float32) / 255.0)[..., None] * float(alpha)
+        output_img = (warped_source.astype(np.float32) * mask_f
+                    + output_img.astype(np.float32) * (1.0 - mask_f)).astype(np.uint8)
+
 
     return output_img
 
