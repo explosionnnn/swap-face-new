@@ -143,7 +143,7 @@ def warp_triangle(src_img, dst_img, pts_src, pts_dst):
     dst_roi[:] = (warped*mask_f + dst_roi*(1.0 - mask_f)).astype(np.uint8)
 
 # ----------------------------
-# Gamma-aware alpha blending
+# sRGB → 線性光空間轉換
 # ----------------------------
 def _srgb_to_linear(x):
     # x: float32 in [0,1]
@@ -151,7 +151,7 @@ def _srgb_to_linear(x):
     return np.where(x <= 0.04045, x/12.92, ((x + a)/(1 + a))**2.4)
 
 # ----------------------------
-# Gamma-aware alpha blending
+# 線性光空間 → sRGB 轉換
 # ----------------------------
 def _linear_to_srgb(x):
     # x: float32 in [0,1]
@@ -159,7 +159,7 @@ def _linear_to_srgb(x):
     return np.where(x <= 0.0031308, 12.92*x, (1+a)*(x**(1/2.4)) - a)
 
 # ----------------------------
-# Gamma-aware alpha blending
+# Gamma-aware alpha blending（考慮 gamma 的透明混合）
 # ----------------------------
 def gamma_aware_blend(fg_bgr_u8, bg_bgr_u8, mask_u8, alpha=0.65):
 
