@@ -7,6 +7,9 @@ from numpy.linalg import norm
 import torch
 import os
 
+# ----------------------------
+# CUDA 加速設定
+# ----------------------------
 def setup_cuda_fast():
     if not torch.cuda.is_available():
         return
@@ -26,15 +29,34 @@ def setup_cuda_fast():
     _fast_stream = torch.cuda.Stream()
     return
 
-setup_cuda_fast()
-
 # ----------------------------
 # 初始化 InsightFace
 # ----------------------------
-print("Loading InsightFace...")
-app = FaceAnalysis(providers=['CPUExecutionProvider'])
-app.prepare(ctx_id=-1, det_size=(640, 640))
-print("InsightFace loaded.")
+def init_insightface(det_size=(640, 640)):
+    """
+    初始化 InsightFace，自動使用 GPU (若可用) 或 CPU fallback。
+
+    Args:
+        det_size (tuple): 偵測輸入大小，預設 (640, 640)
+    
+    Returns:
+        app (FaceAnalysis): 初始化好的 InsightFace 物件
+    """
+    # 判斷是否有 GPU
+    use_gpu = torch.cuda.is_available()
+    provider = 'CUDAExecutionProvider' if use_gpu else 'CPUExecutionProvider'
+    ctx_id = 0 if use_gpu else -1
+
+    print(f"Initializing InsightFace on {'GPU' if use_gpu else 'CPU'}...")
+
+    # 建立 FaceAnalysis 物件
+    app = FaceAnalysis(providers=[provider])
+
+    # ctx_id = 0 表示第一張 GPU，-1 表示 CPU
+    app.prepare(ctx_id=ctx_id, det_size=det_size)
+
+    print("InsightFace loaded.")
+    return app
 
 # ----------------------------
 # Argparse
@@ -68,7 +90,7 @@ def cosine_similarity(v1, v2):
 # 初始化 GFPGAN
 # ----------------------------
 def init_gfpgan():
-    use_cuda = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 7
+    use_cuda = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 6
     device = "cuda" if use_cuda else "cpu"
     print(f"Initializing GFPGAN on {device}...")
 
@@ -85,8 +107,9 @@ def init_gfpgan():
         print(f"GFPGAN initialization failed: {e}")
         return None
 
-
+# ----------------------------
 # -- 安全版三角形 warp：避免 0 邊界吃黑，做 ROI 裁切與反射邊界 --
+# ----------------------------
 def warp_triangle(src_img, dst_img, pts_src, pts_dst):
     pts_src = np.float32(pts_src)
     pts_dst = np.float32(pts_dst)
@@ -119,17 +142,25 @@ def warp_triangle(src_img, dst_img, pts_src, pts_dst):
     mask_f = (mask.astype(np.float32)/255.0)[..., None]
     dst_roi[:] = (warped*mask_f + dst_roi*(1.0 - mask_f)).astype(np.uint8)
 
-
+# ----------------------------
+# Gamma-aware alpha blending
+# ----------------------------
 def _srgb_to_linear(x):
     # x: float32 in [0,1]
     a = 0.055
     return np.where(x <= 0.04045, x/12.92, ((x + a)/(1 + a))**2.4)
 
+# ----------------------------
+# Gamma-aware alpha blending
+# ----------------------------
 def _linear_to_srgb(x):
     # x: float32 in [0,1]
     a = 0.055
     return np.where(x <= 0.0031308, 12.92*x, (1+a)*(x**(1/2.4)) - a)
 
+# ----------------------------
+# Gamma-aware alpha blending
+# ----------------------------
 def gamma_aware_blend(fg_bgr_u8, bg_bgr_u8, mask_u8, alpha=0.65):
 
     # 在「線性光空間」做 alpha 混合，最後轉回 sRGB。
@@ -157,6 +188,9 @@ def gamma_aware_blend(fg_bgr_u8, bg_bgr_u8, mask_u8, alpha=0.65):
     out = _linear_to_srgb(out_lin)
     return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
 
+# ----------------------------
+# 色彩貼合：Lab 空間 a/b 強匹配，L 小幅靠攏
+# ----------------------------
 def color_match_lab_ab(src_bgr, tgt_bgr, mask_u8=None, ab_ratio=0.9, l_ratio=0.3):
 
     # 將 src_bgr（換過來的臉）貼合 tgt_bgr（被換的人）的色彩。
@@ -214,6 +248,9 @@ def color_match_lab_ab(src_bgr, tgt_bgr, mask_u8=None, ab_ratio=0.9, l_ratio=0.3
 # 你原本的 warp_triangle() 要存在
 # def warp_triangle(src_img, dst_img, pts_src, pts_dst): ...
 
+# ----------------------------
+# 建立智慧遮罩
+# ----------------------------
 def build_smart_mask(target_landmarks, img_shape, extra_points=None, feather=15):
 
     # 根據臉部五官自動建立平滑遮罩。
@@ -454,7 +491,6 @@ def swap_faces(source_img, target_img, ref_embedding, gfpgan=None, alpha=0.65, t
 
     return output_img
 
-
 # ----------------------------
 # 影片處理
 # ----------------------------
@@ -503,14 +539,14 @@ def process_video(source_img, input_path, output_path, ref_embedding, gfpgan=Non
 # 三角形切割
 # ----------------------------
 
-
-
-
 # ----------------------------
 # 主程式
 # ----------------------------
 def main():
     args = parse_args()
+    setup_cuda_fast()
+    global app
+    app = init_insightface(det_size=(640, 640))
     source_img = load_image(args.source)
     reference_img = load_image(args.reference)
 
