@@ -20,3 +20,4 @@ pyyaml
 scipy
 tqdm
 onnxruntime
+ffmpeg
