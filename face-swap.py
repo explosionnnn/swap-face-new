@@ -117,10 +117,16 @@ def warp_triangle(src_img, dst_img, pts_src, pts_dst):
     r1 = cv2.boundingRect(pts_src)
     r2 = cv2.boundingRect(pts_dst)
 
+    if r1[2] <= 0 or r1[3] <= 0 or r2[2] <= 0 or r2[3] <= 0:
+        return
+
     # ROI
     src_roi = src_img[r1[1]:r1[1]+r1[3], r1[0]:r1[0]+r1[2]]
     dst_roi = dst_img[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]]
 
+    if src_roi.size == 0 or dst_roi.size == 0:
+        return
+    
     # 轉換到 ROI 座標
     t1 = pts_src - np.array([r1[0], r1[1]], dtype=np.float32)
     t2 = pts_dst - np.array([r2[0], r2[1]], dtype=np.float32)
@@ -320,9 +326,9 @@ def swap_faces(source_img, target_img, ref_embedding, gfpgan=None, alpha=0.65, t
         # =====================================================
         # === 25 額頭點：把水平線改成弧線 ===
         layers = [
-            (-0.12 * h, 7),   # 上層
-            (-0.20 * h, 9),   # 中層
-            (-0.27 * h, 9),   # 下層（接近髮際）
+            (-0.05 * h, 7),   # 上層
+            (-0.10 * h, 9),   # 中層
+            (-0.15 * h, 9),   # 下層（接近髮際）
         ]
         extra_points_list = []
         for y_off, n_pts in layers:
